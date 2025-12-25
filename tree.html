@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>圣诞树 - Holiday Magic</title>
+    <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --gold: #d4af37;
+            --cream: #fceea7;
+        }
+        body { margin: 0; background: #000; overflow: hidden; font-family: 'Times New Roman', serif; }
+        
+        /* UI 容器 */
+        #ui-layer {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            display: flex; flex-direction: column; align-items: center;
+            pointer-events: none; transition: opacity 0.6s ease; z-index: 10;
+        }
+        .ui-hidden { opacity: 0; pointer-events: none; }
+
+        /* 标题 */
+        h1 {
+            font-family: 'Cinzel', serif; font-size: 56px; margin-top: 40px;
+            background: linear-gradient(to bottom, #ffffff 0%, var(--gold) 100%);
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+            text-shadow: 0 0 20px rgba(212, 175, 55, 0.5);
+        }
+
+        /* 加载器 */
+        #loader {
+            position: fixed; inset: 0; background: #000; 
+            display: flex; flex-direction: column; align-items: center; justify-content: center;
+            z-index: 100; transition: opacity 1s ease;
+        }
+        .spinner {
+            width: 40px; height: 40px; border: 2px solid rgba(212, 175, 55, 0.1);
+            border-top: 1px solid var(--gold); border-radius: 50%;
+            animation: spin 1s linear infinite; margin-bottom: 20px;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        #loader p { color: var(--gold); letter-spacing: 4px; font-size: 12px; }
+
+        /* 上传控件 */
+        .upload-wrapper {
+            position: absolute; bottom: 80px; pointer-events: auto;
+            display: flex; flex-direction: column; align-items: center; gap: 10px;
+        }
+        .btn-upload {
+            padding: 12px 24px; border: 1px solid var(--gold); color: var(--gold);
+            background: rgba(255, 255, 255, 0.05); backdrop-filter: blur(10px);
+            cursor: pointer; transition: 0.3s; letter-spacing: 2px;
+        }
+        .btn-upload:hover { background: var(--gold); color: #000; }
+        .hint { color: rgba(252, 238, 167, 0.6); font-size: 12px; }
+
+        /* 视频/CV 容器 */
+        #video-container {
+            position: absolute; bottom: 20px; right: 20px;
+            opacity: 0; pointer-events: none;
+        }
+    </style>
+</head>
+<body>
+
+<div id="loader">
+    <div class="spinner"></div>
+    <p>LOADING HOLIDAY MAGIC</p>
+</div>
+
+<div id="ui-layer">
+    <h1>Merry Christmas</h1>
+    <div class="upload-wrapper">
+        <label class="btn-upload">
+            ADD MEMORIES
+            <input type="file" id="photo-input" hidden accept="image/*">
+        </label>
+        <span class="hint">Press 'H' to Hide Controls</span>
+    </div>
+</div>
+
+<div id="video-container">
+    <video id="webcam" autoplay playsinline></video>
+    <canvas id="cv-canvas"></canvas>
+</div>
+
+<script type="importmap">
+{
+    "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+        "@mediapipe/tasks-vision": "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/+esm"
+    }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { HandLandmarker, FilesetResolver } from '@mediapipe/tasks-vision';
+
+/**
+ * 核心配置与状态
+ */
+const STATE = {
+    mode: 'TREE', // TREE, SCATTER, FOCUS
+    handData: null,
+    targetRotation: { x: 0, y: 0 },
+    focusedObject: null,
+    items: []
+};
+
+/**
+ * 纹理生成器
+ */
+const TextureUtils = {
+    createCandyCaneTexture() {
+        const canvas = document.createElement('canvas');
+        canvas.width = 64; canvas.height = 128;
+        const ctx = canvas.getContext('2d');
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, 64, 128);
+        ctx.strokeStyle = '#ff0000';
+        ctx.lineWidth = 10;
+        for(let i = 0; i < 5; i++) {
+            ctx.beginPath();
+            ctx.moveTo(0, i * 30);
+            ctx.lineTo(64, i * 30 + 30);
+            ctx.stroke();
+        }
+        return new THREE.CanvasTexture(canvas);
+    },
+    createDefaultPhoto() {
+        const canvas = document.createElement('canvas');
+        canvas.width = 512; canvas.height = 512;
+        const ctx = canvas.getContext('2d');
+        ctx.fillStyle = '#d4af37';
+        ctx.fillRect(0,0,512,512);
+        ctx.fillStyle = '#000';
+        ctx.font = 'bold 60px Cinzel';
+        ctx.textAlign = 'center';
+        ctx.fillText('JOYEUX NOEL', 256, 270);
+        return new THREE.CanvasTexture(canvas);
+    }
+};
+
+/**
+ * 粒子对象类
+ */
+class HolidayItem {
+    constructor(mesh, type = 'PARTICLE') {
+        this.mesh = mesh;
+        this.type = type;
+        this.basePos = new THREE.Vector3();
+        this.treePos = new THREE.Vector3();
+        this.scatterPos = new THREE.Vector3().setFromSphericalCoords(
+            8 + Math.random() * 12, Math.random() * Math.PI, Math.random() * Math.PI * 2
+        );
+        this.velocity = new THREE.Vector3(Math.random()-0.5, Math.random()-0.5, Math.random()-0.5).multiplyScalar(0.01);
+        this.randomRot = new THREE.Euler(Math.random()*Math.PI, Math.random()*Math.PI, Math.random()*Math.PI);
+    }
+
+    update(time) {
+        let targetPos = new THREE.Vector3();
+        let targetScale = 1.0;
+
+        if (STATE.mode === 'TREE') {
+            targetPos.copy(this.treePos);
+        } else if (STATE.mode === 'SCATTER') {
+            targetPos.copy(this.scatterPos);
+            this.mesh.rotation.x += this.velocity.x;
+            this.mesh.rotation.y += this.velocity.y;
+        } else if (STATE.mode === 'FOCUS') {
+            if (this === STATE.focusedObject) {
+                targetPos.set(0, 2, 35);
+                targetScale = 4.5;
+                this.mesh.rotation.y = Math.sin(time) * 0.2;
+            } else {
+                targetPos.copy(this.scatterPos).multiplyScalar(2.5);
+            }
+        }
+
+        this.mesh.position.lerp(targetPos, 0.08);
+        const s = THREE.MathUtils.lerp(this.mesh.scale.x, targetScale, 0.1);
+        this.mesh.scale.set(s, s, s);
+    }
+}
+
+/**
+ * 主引擎类
+ */
+class ChristmasEngine {
+    constructor() {
+        this.initScene();
+        this.initPostProcessing();
+        this.createContent();
+        this.initCV();
+        this.bindEvents();
+        this.animate();
+    }
+
+    initScene() {
+        this.scene = new THREE.Scene();
+        this.camera = new THREE.PerspectiveCamera(75, window.innerWidth/window.innerHeight, 0.1, 1000);
+        this.camera.position.set(0, 2, 50);
+
+        this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        this.renderer.setSize(window.innerWidth, window.innerHeight);
+        this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        this.renderer.toneMapping = THREE.ReinhardToneMapping;
+        this.renderer.toneMappingExposure = 2.2;
+        document.body.appendChild(this.renderer.domElement);
+
+        const pmrem = new THREE.PMREMGenerator(this.renderer);
+        this.scene.environment = pmrem.fromScene(new RoomEnvironment()).texture;
+
+        this.mainGroup = new THREE.Group();
+        this.scene.add(this.mainGroup);
+
+        // Lighting
+        this.scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+        const p1 = new THREE.PointLight(0xffaa00, 2);
+        p1.position.set(0, 5, 0);
+        this.scene.add(p1);
+
+        const s1 = new THREE.SpotLight(0xd4af37, 1200);
+        s1.position.set(30, 40, 40);
+        this.scene.add(s1);
+
+        const s2 = new THREE.SpotLight(0x0044ff, 600);
+        s2.position.set(-30, 20, -30);
+        this.scene.add(s2);
+    }
+
+    initPostProcessing() {
+        this.composer = new EffectComposer(this.renderer);
+        this.composer.addPass(new RenderPass(this.scene, this.camera));
+        const bloom = new UnrealBloomPass(
+            new THREE.Vector2(window.innerWidth, window.innerHeight),
+            0.45, 0.4, 0.7
+        );
+        this.composer.addPass(bloom);
+    }
+
+    createContent() {
+        // Materials
+        const goldMat = new THREE.MeshStandardMaterial({ color: 0xd4af37, metalness: 0.9, roughness: 0.1 });
+        const greenMat = new THREE.MeshStandardMaterial({ color: 0x013220, roughness: 0.8 });
+        const redMat = new THREE.MeshPhysicalMaterial({ color: 0xaa0000, clearcoat: 1.0, metalness: 0.5 });
+
+        // 1. 粒子系统 (主体 1500)
+        for (let i = 0; i < 1500; i++) {
+            const t = i / 1500;
+            const geo = Math.random() > 0.5 ? new THREE.BoxGeometry(0.2, 0.2, 0.2) : new THREE.SphereGeometry(0.15, 8, 8);
+            const mat = Math.random() > 0.3 ? goldMat : (Math.random() > 0.5 ? greenMat : redMat);
+            const mesh = new THREE.Mesh(geo, mat);
+            
+            const item = new HolidayItem(mesh);
+            // 螺旋计算
+            const radius = 12 * (1 - t);
+            const angle = t * Math.PI * 50;
+            item.treePos.set(Math.cos(angle) * radius, t * 25 - 10, Math.sin(angle) * radius);
+            
+            this.mainGroup.add(mesh);
+            STATE.items.push(item);
+        }
+
+        // 2. 尘埃粒子 (2500)
+        const dustGeo = new THREE.BufferGeometry();
+        const dustPos = new Float32Array(2500 * 3);
+        for(let i=0; i<2500*3; i++) dustPos[i] = (Math.random()-0.5) * 60;
+        dustGeo.setAttribute('position', new THREE.BufferAttribute(dustPos, 3));
+        const dustPoints = new THREE.Points(dustGeo, new THREE.PointsMaterial({ color: 0xfceea7, size: 0.05, transparent: true, opacity: 0.4 }));
+        this.scene.add(dustPoints);
+
+        // 3. Candy Canes
+        const caneTex = TextureUtils.createCandyCaneTexture();
+        for(let i=0; i<15; i++) {
+            const curve = new THREE.CatmullRomCurve3([
+                new THREE.Vector3(0,0,0), new THREE.Vector3(0,1.5,0),
+                new THREE.Vector3(0.5,2,0), new THREE.Vector3(1,1.5,0)
+            ]);
+            const mesh = new THREE.Mesh(new THREE.TubeGeometry(curve, 20, 0.08, 8, false), new THREE.MeshStandardMaterial({ map: caneTex }));
+            const item = new HolidayItem(mesh);
+            const t = Math.random();
+            const radius = 12 * (1 - t);
+            const angle = t * Math.PI * 50;
+            item.treePos.set(Math.cos(angle) * radius, t * 25 - 10, Math.sin(angle) * radius);
+            this.mainGroup.add(mesh);
+            STATE.items.push(item);
+        }
+
+        // 4. Initial Photo
+        this.addPhotoToScene(TextureUtils.createDefaultPhoto());
+    }
+
+    addPhotoToScene(texture) {
+        const group = new THREE.Group();
+        const frame = new THREE.Mesh(new THREE.BoxGeometry(2.2, 2.2, 0.1), new THREE.MeshStandardMaterial({ color: 0xd4af37, metalness: 0.8 }));
+        const photo = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), new THREE.MeshBasicMaterial({ map: texture }));
+        photo.position.z = 0.06;
+        group.add(frame, photo);
+
+        const item = new HolidayItem(group, 'PHOTO');
+        const t = Math.random() * 0.5 + 0.2;
+        const radius = 12 * (1 - t) + 2;
+        const angle = Math.random() * Math.PI * 2;
+        item.treePos.set(Math.cos(angle) * radius, t * 25 - 10, Math.sin(angle) * radius);
+        
+        this.mainGroup.add(group);
+        STATE.items.push(item);
+    }
+
+    async initCV() {
+        const vision = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/wasm");
+        this.handLandmarker = await HandLandmarker.createFromOptions(vision, {
+            baseOptions: { modelAssetPath: `https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task`, delegate: "GPU" },
+            runningMode: "VIDEO", numHands: 1
+        });
+
+        const video = document.getElementById('webcam');
+        if (navigator.mediaDevices.getUserMedia) {
+            const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720 } });
+            video.srcObject = stream;
+            video.addEventListener('loadeddata', () => {
+                document.getElementById('loader').style.opacity = '0';
+                setTimeout(() => document.getElementById('loader').remove(), 1000);
+            });
+        }
+    }
+
+    processGestures(results) {
+        if (results.landmarks && results.landmarks.length > 0) {
+            const hand = results.landmarks[0];
+            
+            // 1. 映射旋转 (基于 Landmark 9)
+            STATE.targetRotation.y = (hand[9].x - 0.5) * 2;
+            STATE.targetRotation.x = (hand[9].y - 0.5) * 1;
+
+            // 2. 模式识别
+            const dist = (a, b) => Math.hypot(hand[a].x - hand[b].x, hand[a].y - hand[b].y);
+            
+            const pinch = dist(4, 8);
+            const fingertips = [8, 12, 16, 20];
+            const avgDist = fingertips.reduce((s, f) => s + dist(0, f), 0) / 4;
+
+            if (pinch < 0.05) {
+                if (STATE.mode !== 'FOCUS') {
+                    const photos = STATE.items.filter(i => i.type === 'PHOTO');
+                    STATE.focusedObject = photos[Math.floor(Math.random() * photos.length)];
+                    STATE.mode = 'FOCUS';
+                }
+            } else if (avgDist < 0.25) {
+                STATE.mode = 'TREE';
+            } else if (avgDist > 0.4) {
+                STATE.mode = 'SCATTER';
+            }
+        }
+    }
+
+    bindEvents() {
+        window.addEventListener('resize', () => {
+            this.camera.aspect = window.innerWidth / window.innerHeight;
+            this.camera.updateProjectionMatrix();
+            this.renderer.setSize(window.innerWidth, window.innerHeight);
+            this.composer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        window.addEventListener('keydown', (e) => {
+            if (e.key.toLowerCase() === 'h') {
+                document.getElementById('ui-layer').classList.toggle('ui-hidden');
+            }
+        });
+
+        document.getElementById('photo-input').addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (file) {
+                const reader = new FileReader();
+                reader.onload = (ev) => {
+                    new THREE.TextureLoader().load(ev.target.result, (t) => {
+                        t.colorSpace = THREE.SRGBColorSpace;
+                        this.addPhotoToScene(t);
+                    });
+                }
+                reader.readAsDataURL(file);
+            }
+        });
+    }
+
+    animate() {
+        requestAnimationFrame(() => this.animate());
+        const time = performance.now() * 0.001;
+
+        if (this.handLandmarker && document.getElementById('webcam').readyState >= 2) {
+            const results = this.handLandmarker.detectForVideo(document.getElementById('webcam'), performance.now());
+            this.processGestures(results);
+        }
+
+        // 平滑旋转
+        this.mainGroup.rotation.y = THREE.MathUtils.lerp(this.mainGroup.rotation.y, STATE.targetRotation.y, 0.05);
+        this.mainGroup.rotation.x = THREE.MathUtils.lerp(this.mainGroup.rotation.x, STATE.targetRotation.x, 0.05);
+
+        STATE.items.forEach(item => item.update(time));
+        
+        this.composer.render();
+    }
+}
+
+// 启动
+new ChristmasEngine();
+</script>
+</body>
+</html>
